@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS Serverless Spring Boot 2 API - spring.cloud::photo-blog
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Stage name for the deployment
+  DatasourceUsername:
+    Type: String
+    Default: DatasourceUsername
+    Description: Stage name for the deployment
+  DatasourceUrl:
+    Type: String
+    Default: DatasourceUrl
+    Description: Stage name for the deployment
+  DatasourcePassword:
+    Type: String
+    Default: DatasourcePassword
+    Description: Stage name for the deployment
+  ImageKitUrlEndpoint:
+    Type: String
+    Default: ImagekitUrlEndpoint
+  ImageKitPrivateKey:
+    Type: String
+    Default: ImageKitPrivateKey
+  ImageKitPublicKey:
+    Type: String
+    Default: ImageKitPublicKey
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 2048
+    Runtime: java21
+    Environment:
+      Variables:
+        SPRING_PROFILES_ACTIVE: !Ref Stage
+        DATASOURCE_USERNAME: !Ref DatasourceUsername
+        DATASOURCE_URL: !Ref DatasourceUrl
+        DATASOURCE_PASSWORD: !Ref DatasourcePassword
+        COGNITO_USER_POOL_ID: !Ref PhotoBlogUserPool
+        COGNITO_CLIENT_ID: !Ref PhotoBlogUserPoolClient
+        REGION: !Ref AWS::Region
+        IMAGEKIT_URL_ENDPOINT: !Ref ImageKitUrlEndpoint
+        IMAGEKIT_PRIVATE_KEY: !Ref ImageKitPrivateKey
+        IMAGEKIT_PUBLIC_KEY: !Ref ImageKitPublicKey
+        RETRY_QUEUE_URL: !Ref ImageProcessingDLQ
+
+Resources:
+  ProcessedImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Stage}-photoblog-processed-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  StagingImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Stage}-photoblog-staging-${AWS::AccountId}-${AWS::Region}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter1Day
+            Status: Enabled
+            ExpirationInDays: 1
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt ImageProcessingQueue.Arn
+
+  # SQS Queues
+  ImageProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Stage}-image-processing-queue"
+      VisibilityTimeout: 300  # 5 minutes (10x Lambda timeout for safety)
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 2  # Try twice, then DLQ
+
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Stage}-image-processing-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Retry Queue with 5-minute delay
+  ImageProcessingRetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Stage}-image-processing-retry-queue"
+      DelaySeconds: 300  # 5 minutes delay
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 1  # Only one retry, then DLQ
+
+  # SQS Queue Policies
+  ImageProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt ImageProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub "arn:aws:s3:::${Stage}-photoblog-staging-${AWS::AccountId}-${AWS::Region}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Queues:
+        - !Ref ImageProcessingQueue
+
+  PhotoBlogUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-user-pool"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  PhotoBlogUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref PhotoBlogUserPool
+      ClientName: !Sub "${AWS::StackName}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+  PhotoBlogUserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref PhotoBlogUserPool
+      GroupName: USER
+      Description: Regular users group
+
+  PhotoBlogAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref PhotoBlogUserPool
+      GroupName: ADMIN
+      Description: Admin users group
+
+  PhotoBlogDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: photo-blog-dependencies
+      ContentUri: layers/spring-layer/
+      CompatibleRuntimes:
+        - java21
+      RetentionPolicy: Retain
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref Stage
+      BinaryMediaTypes:
+        - "multipart/form-data"
+        - "image/*"
+        - "application/octet-stream"
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+
+  PhotoBlogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: spring.cloud.StreamLambdaHandler::handleRequest
+      Layers:
+        - !Ref PhotoBlogDependenciesLayer
+      CodeUri: .
+      Environment:
+        Variables:
+          STAGING_IMAGE_BUCKET: !Ref StagingImageBucket
+          PROCESSED_IMAGE_BUCKET: !Ref ProcessedImageBucket
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - S3CrudPolicy:
+            BucketName: !Ref StagingImageBucket
+        - S3CrudPolicy:
+            BucketName: !Ref ProcessedImageBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucketVersions
+                - s3:DeleteObjectVersion
+              Resource:
+                - !Sub "${ProcessedImageBucket.Arn}/*"
+                - !GetAtt ProcessedImageBucket.Arn
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminAddUserToGroup
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:AdminRespondToAuthChallenge
+              Resource: !GetAtt PhotoBlogUserPool.Arn
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:GetQueueUrl
+              Resource:
+                - !GetAtt ImageProcessingQueue.Arn
+                - !GetAtt ImageProcessingRetryQueue.Arn
+                - !GetAtt ImageProcessingDLQ.Arn
+      SnapStart:
+        ApplyOn: PublishedVersions
+      AutoPublishAlias: live
+      Events:
+        ProxyResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /{proxy+}
+            Method: any
+        # SQS Events for Image Processing
+        ImageProcessingEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageProcessingQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+        # SQS Events for Retry Processing
+        RetryProcessingEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageProcessingRetryQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 0
+
+Outputs:
+  PhotoBlogApi:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: PhotoBlogApi
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref PhotoBlogUserPool
+    Export:
+      Name: PhotoBlogUserPoolId
+
+  CognitoClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref PhotoBlogUserPoolClient
+    Export:
+      Name: PhotoBlogClientId
+
+  ImageProcessingQueueUrl:
+    Description: Image Processing Queue URL
+    Value: !Ref ImageProcessingQueue
+    Export:
+      Name: ImageProcessingQueueUrl
+
+  ImageProcessingDLQUrl:
+    Description: Image Processing Dead Letter Queue URL
+    Value: !Ref ImageProcessingDLQ
+    Export:
+      Name: ImageProcessingDLQUrl
