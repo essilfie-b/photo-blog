@@ -1,6 +1,7 @@
 package spring.cloud.controllers;
 
 import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -14,6 +15,7 @@ import spring.cloud.services.S3Service;
 @RestController
 @RequestMapping("/api/images")
 @AllArgsConstructor
+@Slf4j
 public class ImageController {
 
     private final S3Service s3Service;
@@ -31,9 +33,9 @@ public class ImageController {
         var request = new WatermarkRequest(text, position, color, fontSize);
 
         var imageUrl = s3Service.uploadImage(file, request);
-        var s3WatermarkedImageUrl = s3Service.uploadImage(imageUrl);
+        log.info("ImageController::uploadImage: File uploaded to staging: {}", imageUrl);
 
-        return ResponseEntity.ok(new WatermarkResponse(s3WatermarkedImageUrl, true));
+        return ResponseEntity.ok(new WatermarkResponse("Image uploaded successfully. Processing started.", true));
     }
 
     @GetMapping

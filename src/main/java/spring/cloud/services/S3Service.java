@@ -13,4 +13,6 @@ public interface S3Service {
     void restoreImage(String imageUrl);
 
     void permanentDeleteImage(String imageUrl);
+
+    byte[] getObjectFromStaging(String objectKey);
 }

@@ -6,17 +6,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
-import software.amazon.awssdk.services.s3.model.ListObjectVersionsRequest;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.*;
 import spring.cloud.config.S3Config;
 import spring.cloud.dtos.images.WatermarkRequest;
 import spring.cloud.entities.Image;
 import spring.cloud.exceptions.InvalidOperationException;
 import spring.cloud.repositories.ImageRepository;
 import spring.cloud.services.CognitoService;
-import spring.cloud.services.ImageKitService;
 import spring.cloud.services.S3Service;
 
 import java.io.IOException;
@@ -33,7 +29,6 @@ import java.util.UUID;
 public class S3ServiceImpl implements S3Service {
     private final S3Client s3Client;
     private final S3Config s3Config;
-    private final ImageKitService imageKitService;
     private final CognitoService cognitoService;
     private final ImageRepository imageRepository;
 
@@ -41,10 +36,8 @@ public class S3ServiceImpl implements S3Service {
 
     @Override
     public String uploadImage(MultipartFile file, WatermarkRequest request) {
-        var imageKey = generateImageKey(file);
-        var objectUrl = uploadImageToS3(imageKey, file);
-
-        return imageKitService.addWatermark(objectUrl, request);
+        var imageKey = generateImageKeyWithMetadata(file, request);
+        return uploadImageToS3Staging(imageKey, file);
     }
 
     @Override
@@ -91,8 +84,11 @@ public class S3ServiceImpl implements S3Service {
                 return objectUrl;
             }
 
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
             throw new InvalidOperationException("Failed to download image from URL: " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new InvalidOperationException("Image download was interrupted: " + e.getMessage());
         } catch (S3Exception e) {
             throw new InvalidOperationException("S3 upload failed: " + e.getMessage());
         }
@@ -132,6 +128,22 @@ public class S3ServiceImpl implements S3Service {
             deleteAllVersions(bucketName, key);
         } catch (S3Exception e) {
             throw new InvalidOperationException("Failed to restore image in S3: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public byte[] getObjectFromStaging(String objectKey) {
+        try {
+            var getObjectRequest = GetObjectRequest.builder()
+                    .bucket(s3Config.stagingBucketName())
+                    .key(objectKey)
+                    .build();
+
+            var response = s3Client.getObject(getObjectRequest);
+            return response.readAllBytes();
+
+        } catch (Exception e) {
+            throw new InvalidOperationException("Failed to get object from staging: " + e.getMessage());
         }
     }
 
@@ -259,7 +271,24 @@ public class S3ServiceImpl implements S3Service {
         }
     }
 
-    private String uploadImageToS3(String key, MultipartFile file) {
+    private String generateImageKeyWithMetadata(MultipartFile file, WatermarkRequest request) {
+        var fileName = file.getOriginalFilename();
+        var extension = "";
+
+        if (fileName != null && fileName.contains("."))
+            extension = fileName.substring(fileName.lastIndexOf("."));
+
+        return String.format("images/unprocessed_%d_%s_%s_%s_%s_%d%s",
+                System.currentTimeMillis(),
+                UUID.randomUUID().toString().substring(0, 8),
+                request.text().replaceAll("[^a-zA-Z0-9]", ""),
+                request.position(),
+                request.color(),
+                request.fontSize(),
+                extension);
+    }
+
+    private String uploadImageToS3Staging(String key, MultipartFile file) {
         try {
             var putObjectRequest = PutObjectRequest.builder()
                     .bucket(s3Config.stagingBucketName())
@@ -267,6 +296,7 @@ public class S3ServiceImpl implements S3Service {
                     .contentType(file.getContentType())
                     .contentLength(file.getSize())
                     .build();
+
             s3Client.putObject(putObjectRequest,
                     RequestBody.fromInputStream(file.getInputStream(), file.getSize()));
 
@@ -278,19 +308,5 @@ public class S3ServiceImpl implements S3Service {
         } catch (S3Exception e) {
             throw new InvalidOperationException("S3 upload failed: " + e.getMessage());
         }
-    }
-
-    private String generateImageKey(MultipartFile file) {
-        var fileName = file.getOriginalFilename();
-        var extension = "";
-
-        if (fileName != null && fileName.contains("."))
-            extension = fileName.substring(fileName.lastIndexOf("."));
-
-        return String.format("images/unprocessed_%d_%s%s",
-                System.currentTimeMillis(),
-                UUID.randomUUID().toString().substring(0, 8),
-                extension);
-
     }
 }

@@ -17,6 +17,8 @@ aws:
     staging-bucket-name: ${STAGING_IMAGE_BUCKET}
     processed-bucket-name: ${PROCESSED_IMAGE_BUCKET}
     region: ${REGION}
+  sqs:
+    retry-queue-url: ${RETRY_QUEUE_URL}
 
 imagekit:
   url-endpoint: ${IMAGEKIT_URL_ENDPOINT}
